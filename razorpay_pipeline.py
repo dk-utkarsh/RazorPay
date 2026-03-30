@@ -2,14 +2,12 @@
 """
 Razorpay Settlement CSV Pipeline
 
-Downloads daily settlement CSV from Zoho Mail (sent to razorpay@dentalkart.com),
+Downloads daily settlement CSV via Razorpay API,
 adds a 'Created Date' column, and pushes it to Zoho Analytics.
 
 Scheduled via cron: 5 8 * * * (daily at 8:05 AM)
 """
 
-import imaplib
-import email as email_lib
 import os
 import csv
 import json
@@ -17,14 +15,15 @@ import time
 import logging
 import sys
 import requests
+from requests.auth import HTTPBasicAuth
 from datetime import date, datetime
 from dotenv import load_dotenv
 
 # ============ INIT ============
 load_dotenv()
 
-ZOHO_EMAIL = os.getenv("ZOHO_EMAIL")
-ZOHO_APP_PASSWORD = os.getenv("ZOHO_APP_PASSWORD")
+RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID")
+RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET")
 ZOHO_ORG_ID = os.getenv("ZOHO_ORG_ID")
 ZOHO_WORKSPACE_ID = os.getenv("ZOHO_WORKSPACE_ID")
 ZOHO_ANALYTICS_VIEW_ID = os.getenv("ZOHO_ANALYTICS_VIEW_ID")
@@ -32,15 +31,12 @@ ZOHO_CLIENT_ID = os.getenv("ZOHO_CLIENT_ID")
 ZOHO_CLIENT_SECRET = os.getenv("ZOHO_CLIENT_SECRET")
 ZOHO_REFRESH_TOKEN = os.getenv("ZOHO_REFRESH_TOKEN")
 
-IMAP_HOST = "imappro.zoho.in"
-IMAP_PORT = 993
-TO_FILTER = "razorpay@dentalkart.com"
 DOWNLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "downloads")
 RETRY_ATTEMPTS = 3
 RETRY_DELAY = 300  # 5 minutes
 
 REQUIRED_ENV = [
-    "ZOHO_EMAIL", "ZOHO_APP_PASSWORD", "ZOHO_CLIENT_ID",
+    "RAZORPAY_KEY_ID", "RAZORPAY_KEY_SECRET", "ZOHO_CLIENT_ID",
     "ZOHO_CLIENT_SECRET", "ZOHO_REFRESH_TOKEN",
     "ZOHO_WORKSPACE_ID", "ZOHO_ANALYTICS_VIEW_ID", "ZOHO_ORG_ID",
 ]
@@ -60,52 +56,37 @@ logging.basicConfig(
 log = logging.getLogger("razorpay_pipeline")
 
 
-# ============ ZOHO MAIL ============
-def fetch_csv_from_mail():
-    """Download CSV attachments from today's unread emails sent to razorpay@dentalkart.com."""
-    log.info("Connecting to Zoho Mail...")
-    mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
-    try:
-        mail.login(ZOHO_EMAIL, ZOHO_APP_PASSWORD)
-        mail.select("INBOX")
+# ============ RAZORPAY API ============
+def fetch_csv_from_razorpay():
+    """Download today's settlement recon CSV via Razorpay API."""
+    today = date.today()
+    log.info(f"Fetching settlement report from Razorpay API for {today.isoformat()}...")
 
-        today = date.today().strftime("%d-%b-%Y")
-        _, msg_ids = mail.search(None, f'(TO "{TO_FILTER}" SINCE "{today}" UNSEEN)')
+    resp = requests.get(
+        "https://api.razorpay.com/v1/settlements/recon/combined",
+        auth=HTTPBasicAuth(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET),
+        params={"year": today.year, "month": today.month, "day": today.day},
+        timeout=120,
+    )
 
-        raw_ids = msg_ids[0].split()
-        if not raw_ids:
-            log.info("No new emails found.")
-            return []
+    if resp.status_code == 200:
+        content_type = resp.headers.get("Content-Type", "")
+        if "text/csv" in content_type or "application/octet-stream" in content_type or resp.content:
+            os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+            filename = f"{today.isoformat()}_settlement_recon.csv"
+            csv_path = os.path.join(DOWNLOAD_DIR, filename)
+            with open(csv_path, "wb") as f:
+                f.write(resp.content)
+            log.info(f"Downloaded: {csv_path} ({len(resp.content)} bytes)")
+            return [csv_path]
 
-        log.info(f"Found {len(raw_ids)} unread email(s).")
-        csv_files = []
+    if resp.status_code == 404:
+        log.info("No settlement data available for today yet.")
+        return []
 
-        for msg_id in raw_ids:
-            _, msg_data = mail.fetch(msg_id, "(RFC822)")
-            msg = email_lib.message_from_bytes(msg_data[0][1])
-            subject = msg.get("Subject", "(No Subject)")
-            log.info(f"Processing: {subject}")
-
-            for part in msg.walk():
-                filename = part.get_filename()
-                if not filename or not filename.lower().endswith(".csv"):
-                    continue
-
-                os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-                csv_path = os.path.join(
-                    DOWNLOAD_DIR, f"{date.today().isoformat()}_{filename}"
-                )
-                with open(csv_path, "wb") as f:
-                    f.write(part.get_payload(decode=True))
-
-                csv_files.append(csv_path)
-                log.info(f"Downloaded: {csv_path}")
-
-            mail.store(msg_id, "+FLAGS", "\\Seen")
-
-        return csv_files
-    finally:
-        mail.logout()
+    log.error(f"Razorpay API error ({resp.status_code}): {resp.text}")
+    resp.raise_for_status()
+    return []
 
 
 # ============ CSV TRANSFORM ============
@@ -205,8 +186,8 @@ def run():
     # Fetch with retries (email might arrive late)
     csv_files = []
     for attempt in range(1, RETRY_ATTEMPTS + 1):
-        log.info(f"Attempt {attempt}/{RETRY_ATTEMPTS}: checking mail...")
-        csv_files = fetch_csv_from_mail()
+        log.info(f"Attempt {attempt}/{RETRY_ATTEMPTS}: fetching from Razorpay API...")
+        csv_files = fetch_csv_from_razorpay()
         if csv_files:
             break
         if attempt < RETRY_ATTEMPTS:
